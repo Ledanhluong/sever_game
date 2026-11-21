@@ -25,6 +25,13 @@ SECRET_KEY = os.getenv("SECRET_KEY", "doi_chuoi_bi_mat_nay_khi_dua_len_server_20
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DB_PATH = "game_server.db"
 
+# Danh sách cụm server của game (bạn có thể mở thêm S4, S5... tại đây bất cứ lúc nào)
+GAME_SERVERS = [
+    {"id": "S1", "name": "S1 - Thạch Thôn", "status": "Mới", "recommended": True},
+    {"id": "S2", "name": "S2 - Bổ Thiên Các", "status": "Tốt", "recommended": False},
+    {"id": "S3", "name": "S3 - Hư Thần Giới", "status": "Đông", "recommended": False},
+]
+
 login_attempts: dict[str, list[float]] = {}
 
 def dung_postgres() -> bool:
@@ -48,18 +55,23 @@ def init_db():
                     username TEXT UNIQUE NOT NULL,
                     password_hash TEXT NOT NULL,
                     salt TEXT NOT NULL,
-                    selected_character TEXT DEFAULT 'cha1',
-                    level INTEGER DEFAULT 1,
-                    vang INTEGER DEFAULT 1000,
-                    da_quy INTEGER DEFAULT 100,
-                    game_data TEXT DEFAULT '{}',
-                    updated_at DOUBLE PRECISION DEFAULT 0,
                     created_at DOUBLE PRECISION
                 )
             """)
-            # Tự động thêm cột nếu bảng users đã tồn tại từ bản cũ
-            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS game_data TEXT DEFAULT '{}'")
-            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at DOUBLE PRECISION DEFAULT 0")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS player_saves (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    server_id TEXT NOT NULL,
+                    selected_character TEXT DEFAULT 'cha1',
+                    level INTEGER DEFAULT 1,
+                    vang INTEGER DEFAULT 10000000,
+                    da_quy INTEGER DEFAULT 1000000,
+                    game_data TEXT DEFAULT '{}',
+                    updated_at DOUBLE PRECISION DEFAULT 0,
+                    UNIQUE(user_id, server_id)
+                )
+            """)
         conn.commit()
     else:
         conn.execute("""
@@ -68,13 +80,21 @@ def init_db():
                 username TEXT UNIQUE NOT NULL,
                 password_hash TEXT NOT NULL,
                 salt TEXT NOT NULL,
+                created_at REAL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS player_saves (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                server_id TEXT NOT NULL,
                 selected_character TEXT DEFAULT 'cha1',
                 level INTEGER DEFAULT 1,
-                vang INTEGER DEFAULT 1000,
-                da_quy INTEGER DEFAULT 100,
+                vang INTEGER DEFAULT 10000000,
+                da_quy INTEGER DEFAULT 1000000,
                 game_data TEXT DEFAULT '{}',
                 updated_at REAL DEFAULT 0,
-                created_at REAL
+                UNIQUE(user_id, server_id)
             )
         """)
         conn.commit()
@@ -121,18 +141,48 @@ def decode_user_from_header(authorization: str) -> dict:
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail={"message": "Phiên đăng nhập hết hạn hoặc không hợp lệ!"})
 
-def format_player_data(row: dict) -> dict:
-    raw_extra = row.get("game_data") or "{}"
+def get_or_create_server_save(conn, user_id: int, username: str, server_id: str) -> dict:
+    valid_ids = {s["id"] for s in GAME_SERVERS}
+    if server_id not in valid_ids:
+        raise HTTPException(status_code=400, detail={"message": "Máy chủ không tồn tại!"})
+
+    if dung_postgres():
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM player_saves WHERE user_id = %s AND server_id = %s", (user_id, server_id))
+            row = cur.fetchone()
+            if row is None:
+                now = time.time()
+                cur.execute(
+                    "INSERT INTO player_saves (user_id, server_id, updated_at) VALUES (%s, %s, %s) RETURNING *",
+                    (user_id, server_id, now)
+                )
+                row = cur.fetchone()
+                conn.commit()
+    else:
+        row = conn.execute("SELECT * FROM player_saves WHERE user_id = ? AND server_id = ?", (user_id, server_id)).fetchone()
+        if row is None:
+            now = time.time()
+            conn.execute(
+                "INSERT INTO player_saves (user_id, server_id, updated_at) VALUES (?, ?, ?)",
+                (user_id, server_id, now)
+            )
+            conn.commit()
+            row = conn.execute("SELECT * FROM player_saves WHERE user_id = ? AND server_id = ?", (user_id, server_id)).fetchone()
+
+    row_dict = dict(row)
+    raw_extra = row_dict.get("game_data") or "{}"
     try:
         extra_dict = json.loads(raw_extra) if isinstance(raw_extra, str) else dict(raw_extra)
     except Exception:
         extra_dict = {}
+
     return {
-        "username": row["username"],
-        "selected_character": row["selected_character"],
-        "level": row["level"],
-        "vang": row["vang"],
-        "da_quy": row["da_quy"],
+        "username": username,
+        "server_id": server_id,
+        "selected_character": row_dict["selected_character"],
+        "level": row_dict["level"],
+        "vang": row_dict["vang"],
+        "da_quy": row_dict["da_quy"],
         "game_data": extra_dict
     }
 
@@ -141,6 +191,7 @@ class AuthPayload(BaseModel):
     password: str
 
 class SyncPayload(BaseModel):
+    server_id: str = "S1"
     selected_character: str = "cha1"
     level: int = Field(ge=1, le=9999)
     vang: int = Field(ge=0, le=2_000_000_000)
@@ -155,6 +206,40 @@ def health_check():
         "database": "postgresql" if dung_postgres() else "sqlite",
         "message": "Server game đang hoạt động"
     }
+
+@app.get("/servers")
+def list_servers(authorization: str = Header(default="")):
+    # Trả về danh sách server kèm thông tin nhân vật đã tạo ở từng server (nếu có)
+    played_map: dict[str, dict] = {}
+    if authorization.startswith("Bearer "):
+        try:
+            decoded = decode_user_from_header(authorization)
+            conn = get_db()
+            if dung_postgres():
+                with conn.cursor() as cur:
+                    cur.execute("SELECT server_id, level, selected_character FROM player_saves WHERE user_id = %s", (decoded["uid"],))
+                    rows = cur.fetchall()
+            else:
+                rows = conn.execute("SELECT server_id, level, selected_character FROM player_saves WHERE user_id = ?", (decoded["uid"],)).fetchall()
+            conn.close()
+            for r in rows:
+                rd = dict(r)
+                played_map[rd["server_id"]] = {"level": rd["level"], "selected_character": rd["selected_character"]}
+        except Exception:
+            pass
+
+    result = []
+    for sv in GAME_SERVERS:
+        item = dict(sv)
+        if sv["id"] in played_map:
+            item["has_character"] = True
+            item["level"] = played_map[sv["id"]]["level"]
+        else:
+            item["has_character"] = False
+            item["level"] = 0
+        result.append(item)
+
+    return {"ok": True, "servers": result}
 
 @app.post("/register")
 def register(payload: AuthPayload):
@@ -171,14 +256,14 @@ def register(payload: AuthPayload):
         if dung_postgres():
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO users (username, password_hash, salt, updated_at, created_at) VALUES (%s, %s, %s, %s, %s)",
-                    (payload.username, pwd_hash, salt_hex, now, now)
+                    "INSERT INTO users (username, password_hash, salt, created_at) VALUES (%s, %s, %s, %s)",
+                    (payload.username, pwd_hash, salt_hex, now)
                 )
             conn.commit()
         else:
             conn.execute(
-                "INSERT INTO users (username, password_hash, salt, updated_at, created_at) VALUES (?, ?, ?, ?, ?)",
-                (payload.username, pwd_hash, salt_hex, now, now)
+                "INSERT INTO users (username, password_hash, salt, created_at) VALUES (?, ?, ?, ?)",
+                (payload.username, pwd_hash, salt_hex, now)
             )
             conn.commit()
     except Exception as e:
@@ -227,32 +312,21 @@ def login(payload: AuthPayload, request: Request):
         "ok": True,
         "message": "Đăng nhập thành công!",
         "token": token,
-        "player_data": format_player_data(row_dict)
+        "username": row_dict["username"]
     }
 
 @app.get("/me")
-def get_my_profile(authorization: str = Header(default="")):
+def get_my_account(authorization: str = Header(default="")):
     decoded = decode_user_from_header(authorization)
+    return {"ok": True, "username": decoded["username"]}
 
+@app.get("/character/{server_id}")
+def enter_server(server_id: str, authorization: str = Header(default="")):
+    decoded = decode_user_from_header(authorization)
     conn = get_db()
-    if dung_postgres():
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT username, selected_character, level, vang, da_quy, game_data FROM users WHERE id = %s",
-                (decoded["uid"],)
-            )
-            row = cur.fetchone()
-    else:
-        row = conn.execute(
-            "SELECT username, selected_character, level, vang, da_quy, game_data FROM users WHERE id = ?",
-            (decoded["uid"],)
-        ).fetchone()
+    pdata = get_or_create_server_save(conn, decoded["uid"], decoded["username"], server_id)
     conn.close()
-
-    if row is None:
-        raise HTTPException(status_code=404, detail={"message": "Không tìm thấy người chơi!"})
-
-    return {"ok": True, "player_data": format_player_data(dict(row))}
+    return {"ok": True, "player_data": pdata}
 
 @app.post("/sync")
 def sync_player_data(payload: SyncPayload, authorization: str = Header(default="")):
@@ -260,23 +334,12 @@ def sync_player_data(payload: SyncPayload, authorization: str = Header(default="
     uid = decoded["uid"]
 
     conn = get_db()
-    if dung_postgres():
-        with conn.cursor() as cur:
-            cur.execute("SELECT level, vang, da_quy FROM users WHERE id = %s", (uid,))
-            current = cur.fetchone()
-    else:
-        current = conn.execute("SELECT level, vang, da_quy FROM users WHERE id = ?", (uid,)).fetchone()
+    current = get_or_create_server_save(conn, uid, decoded["username"], payload.server_id)
 
-    if current is None:
-        conn.close()
-        raise HTTPException(status_code=404, detail={"message": "Không tìm thấy người chơi!"})
-
-    cur_dict = dict(current)
-    # Kiểm tra chống hack chỉ số tăng đột biến bất thường trong 1 lần sync
-    if payload.vang - cur_dict["vang"] > 50_000_000 or payload.da_quy - cur_dict["da_quy"] > 500_000:
+    if payload.vang - current["vang"] > 50_000_000 or payload.da_quy - current["da_quy"] > 500_000:
         conn.close()
         raise HTTPException(status_code=400, detail={"message": "Phát hiện biến động tài nguyên bất thường!"})
-    if payload.level < cur_dict["level"] or payload.level - cur_dict["level"] > 50:
+    if payload.level < current["level"] or payload.level - current["level"] > 50:
         conn.close()
         raise HTTPException(status_code=400, detail={"message": "Cấp độ không hợp lệ!"})
 
@@ -287,21 +350,21 @@ def sync_player_data(payload: SyncPayload, authorization: str = Header(default="
         with conn.cursor() as cur:
             cur.execute(
                 """
-                UPDATE users
+                UPDATE player_saves
                 SET selected_character = %s, level = %s, vang = %s, da_quy = %s, game_data = %s, updated_at = %s
-                WHERE id = %s
+                WHERE user_id = %s AND server_id = %s
                 """,
-                (payload.selected_character, payload.level, payload.vang, payload.da_quy, extra_json, now, uid)
+                (payload.selected_character, payload.level, payload.vang, payload.da_quy, extra_json, now, uid, payload.server_id)
             )
         conn.commit()
     else:
         conn.execute(
             """
-            UPDATE users
+            UPDATE player_saves
             SET selected_character = ?, level = ?, vang = ?, da_quy = ?, game_data = ?, updated_at = ?
-            WHERE id = ?
+            WHERE user_id = ? AND server_id = ?
             """,
-            (payload.selected_character, payload.level, payload.vang, payload.da_quy, extra_json, now, uid)
+            (payload.selected_character, payload.level, payload.vang, payload.da_quy, extra_json, now, uid, payload.server_id)
         )
         conn.commit()
     conn.close()
