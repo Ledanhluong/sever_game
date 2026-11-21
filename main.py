@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import time
 import hmac
 import hashlib
@@ -9,7 +10,7 @@ import psycopg
 from psycopg.rows import dict_row
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 app = FastAPI(title="Tu Tien Game Backend")
 
@@ -51,9 +52,14 @@ def init_db():
                     level INTEGER DEFAULT 1,
                     vang INTEGER DEFAULT 1000,
                     da_quy INTEGER DEFAULT 100,
+                    game_data TEXT DEFAULT '{}',
+                    updated_at DOUBLE PRECISION DEFAULT 0,
                     created_at DOUBLE PRECISION
                 )
             """)
+            # Tự động thêm cột nếu bảng users đã tồn tại từ bản cũ
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS game_data TEXT DEFAULT '{}'")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at DOUBLE PRECISION DEFAULT 0")
         conn.commit()
     else:
         conn.execute("""
@@ -66,6 +72,8 @@ def init_db():
                 level INTEGER DEFAULT 1,
                 vang INTEGER DEFAULT 1000,
                 da_quy INTEGER DEFAULT 100,
+                game_data TEXT DEFAULT '{}',
+                updated_at REAL DEFAULT 0,
                 created_at REAL
             )
         """)
@@ -104,9 +112,40 @@ def check_rate_limit(client_ip: str):
     history.append(now)
     login_attempts[client_ip] = history
 
+def decode_user_from_header(authorization: str) -> dict:
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail={"message": "Thiếu token xác thực!"})
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        return jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail={"message": "Phiên đăng nhập hết hạn hoặc không hợp lệ!"})
+
+def format_player_data(row: dict) -> dict:
+    raw_extra = row.get("game_data") or "{}"
+    try:
+        extra_dict = json.loads(raw_extra) if isinstance(raw_extra, str) else dict(raw_extra)
+    except Exception:
+        extra_dict = {}
+    return {
+        "username": row["username"],
+        "selected_character": row["selected_character"],
+        "level": row["level"],
+        "vang": row["vang"],
+        "da_quy": row["da_quy"],
+        "game_data": extra_dict
+    }
+
 class AuthPayload(BaseModel):
     username: str
     password: str
+
+class SyncPayload(BaseModel):
+    selected_character: str = "cha1"
+    level: int = Field(ge=1, le=9999)
+    vang: int = Field(ge=0, le=2_000_000_000)
+    da_quy: int = Field(ge=0, le=100_000_000)
+    game_data: dict = Field(default_factory=dict)
 
 @app.get("/")
 @app.head("/")
@@ -126,19 +165,20 @@ def register(payload: AuthPayload):
         raise HTTPException(status_code=400, detail={"message": "Mật khẩu phải có ít nhất 4 ký tự!"})
 
     pwd_hash, salt_hex = hash_password(payload.password)
+    now = time.time()
     conn = get_db()
     try:
         if dung_postgres():
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO users (username, password_hash, salt, created_at) VALUES (%s, %s, %s, %s)",
-                    (payload.username, pwd_hash, salt_hex, time.time())
+                    "INSERT INTO users (username, password_hash, salt, updated_at, created_at) VALUES (%s, %s, %s, %s, %s)",
+                    (payload.username, pwd_hash, salt_hex, now, now)
                 )
             conn.commit()
         else:
             conn.execute(
-                "INSERT INTO users (username, password_hash, salt, created_at) VALUES (?, ?, ?, ?)",
-                (payload.username, pwd_hash, salt_hex, time.time())
+                "INSERT INTO users (username, password_hash, salt, updated_at, created_at) VALUES (?, ?, ?, ?, ?)",
+                (payload.username, pwd_hash, salt_hex, now, now)
             )
             conn.commit()
     except Exception as e:
@@ -167,15 +207,16 @@ def login(payload: AuthPayload, request: Request):
     if row is None:
         raise HTTPException(status_code=401, detail={"message": "Sai tên đăng nhập!"})
 
-    if not verify_password(payload.password, row["password_hash"], row["salt"]):
+    row_dict = dict(row)
+    if not verify_password(payload.password, row_dict["password_hash"], row_dict["salt"]):
         raise HTTPException(status_code=401, detail={"message": "Sai mật khẩu!"})
 
     login_attempts.pop(client_ip, None)
 
     token = jwt.encode(
         {
-            "uid": row["id"],
-            "username": row["username"],
+            "uid": row_dict["id"],
+            "username": row_dict["username"],
             "exp": int(time.time()) + 7 * 86400
         },
         SECRET_KEY,
@@ -186,36 +227,24 @@ def login(payload: AuthPayload, request: Request):
         "ok": True,
         "message": "Đăng nhập thành công!",
         "token": token,
-        "player_data": {
-            "username": row["username"],
-            "selected_character": row["selected_character"],
-            "level": row["level"],
-            "vang": row["vang"],
-            "da_quy": row["da_quy"]
-        }
+        "player_data": format_player_data(row_dict)
     }
 
 @app.get("/me")
 def get_my_profile(authorization: str = Header(default="")):
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail={"message": "Thiếu token xác thực!"})
-    token = authorization.removeprefix("Bearer ").strip()
-    try:
-        decoded = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
-    except jwt.PyJWTError:
-        raise HTTPException(status_code=401, detail={"message": "Phiên đăng nhập hết hạn hoặc không hợp lệ!"})
+    decoded = decode_user_from_header(authorization)
 
     conn = get_db()
     if dung_postgres():
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT username, selected_character, level, vang, da_quy FROM users WHERE id = %s",
+                "SELECT username, selected_character, level, vang, da_quy, game_data FROM users WHERE id = %s",
                 (decoded["uid"],)
             )
             row = cur.fetchone()
     else:
         row = conn.execute(
-            "SELECT username, selected_character, level, vang, da_quy FROM users WHERE id = ?",
+            "SELECT username, selected_character, level, vang, da_quy, game_data FROM users WHERE id = ?",
             (decoded["uid"],)
         ).fetchone()
     conn.close()
@@ -223,4 +252,58 @@ def get_my_profile(authorization: str = Header(default="")):
     if row is None:
         raise HTTPException(status_code=404, detail={"message": "Không tìm thấy người chơi!"})
 
-    return {"ok": True, "player_data": dict(row)}
+    return {"ok": True, "player_data": format_player_data(dict(row))}
+
+@app.post("/sync")
+def sync_player_data(payload: SyncPayload, authorization: str = Header(default="")):
+    decoded = decode_user_from_header(authorization)
+    uid = decoded["uid"]
+
+    conn = get_db()
+    if dung_postgres():
+        with conn.cursor() as cur:
+            cur.execute("SELECT level, vang, da_quy FROM users WHERE id = %s", (uid,))
+            current = cur.fetchone()
+    else:
+        current = conn.execute("SELECT level, vang, da_quy FROM users WHERE id = ?", (uid,)).fetchone()
+
+    if current is None:
+        conn.close()
+        raise HTTPException(status_code=404, detail={"message": "Không tìm thấy người chơi!"})
+
+    cur_dict = dict(current)
+    # Kiểm tra chống hack chỉ số tăng đột biến bất thường trong 1 lần sync
+    if payload.vang - cur_dict["vang"] > 50_000_000 or payload.da_quy - cur_dict["da_quy"] > 500_000:
+        conn.close()
+        raise HTTPException(status_code=400, detail={"message": "Phát hiện biến động tài nguyên bất thường!"})
+    if payload.level < cur_dict["level"] or payload.level - cur_dict["level"] > 50:
+        conn.close()
+        raise HTTPException(status_code=400, detail={"message": "Cấp độ không hợp lệ!"})
+
+    extra_json = json.dumps(payload.game_data, ensure_ascii=False)
+    now = time.time()
+
+    if dung_postgres():
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE users
+                SET selected_character = %s, level = %s, vang = %s, da_quy = %s, game_data = %s, updated_at = %s
+                WHERE id = %s
+                """,
+                (payload.selected_character, payload.level, payload.vang, payload.da_quy, extra_json, now, uid)
+            )
+        conn.commit()
+    else:
+        conn.execute(
+            """
+            UPDATE users
+            SET selected_character = ?, level = ?, vang = ?, da_quy = ?, game_data = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (payload.selected_character, payload.level, payload.vang, payload.da_quy, extra_json, now, uid)
+        )
+        conn.commit()
+    conn.close()
+
+    return {"ok": True, "message": "Đã đồng bộ dữ liệu lên máy chủ!", "updated_at": now}
