@@ -5,13 +5,14 @@ import hmac
 import hashlib
 import sqlite3
 import jwt
+import psycopg
+from psycopg.rows import dict_row
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 app = FastAPI(title="Tu Tien Game Backend")
 
-# Cho phép Web export / Mobile gọi API không bị chặn CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,37 +21,59 @@ app.add_middleware(
 )
 
 SECRET_KEY = os.getenv("SECRET_KEY", "doi_chuoi_bi_mat_nay_khi_dua_len_server_2026")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DB_PATH = "game_server.db"
 
-# Bộ nhớ đệm chống spam đăng nhập (IP -> danh sách timestamp)
 login_attempts: dict[str, list[float]] = {}
 
+def dung_postgres() -> bool:
+    return DATABASE_URL.startswith("postgres://") or DATABASE_URL.startswith("postgresql://")
+
 def get_db():
+    if dung_postgres():
+        url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+        return psycopg.connect(url, row_factory=dict_row)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
     conn = get_db()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            salt TEXT NOT NULL,
-            selected_character TEXT DEFAULT 'cha1',
-            level INTEGER DEFAULT 1,
-            vang INTEGER DEFAULT 1000,
-            da_quy INTEGER DEFAULT 100,
-            created_at REAL
-        )
-    """)
-    conn.commit()
+    if dung_postgres():
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id SERIAL PRIMARY KEY,
+                    username TEXT UNIQUE NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    salt TEXT NOT NULL,
+                    selected_character TEXT DEFAULT 'cha1',
+                    level INTEGER DEFAULT 1,
+                    vang INTEGER DEFAULT 1000,
+                    da_quy INTEGER DEFAULT 100,
+                    created_at DOUBLE PRECISION
+                )
+            """)
+        conn.commit()
+    else:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                salt TEXT NOT NULL,
+                selected_character TEXT DEFAULT 'cha1',
+                level INTEGER DEFAULT 1,
+                vang INTEGER DEFAULT 1000,
+                da_quy INTEGER DEFAULT 100,
+                created_at REAL
+            )
+        """)
+        conn.commit()
     conn.close()
 
 init_db()
 
-# --- Hàm băm & kiểm tra mật khẩu an toàn ---
 def hash_password(password: str, salt_hex: str | None = None) -> tuple[str, str]:
     salt = bytes.fromhex(salt_hex) if salt_hex else os.urandom(16)
     pwd_hash = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 120_000)
@@ -60,7 +83,6 @@ def verify_password(password: str, stored_hash: str, salt_hex: str) -> bool:
     check_hash, _ = hash_password(password, salt_hex)
     return hmac.compare_digest(check_hash, stored_hash)
 
-# --- Kiểm tra tên đăng nhập khớp luật Godot (có cả chữ và số, không dấu cách) ---
 def validate_username(username: str) -> str | None:
     if not username:
         return "Tên đăng nhập không được để trống!"
@@ -74,7 +96,6 @@ def validate_username(username: str) -> str | None:
         return "Tên đăng nhập phải từ 4 đến 24 ký tự!"
     return None
 
-# --- Chống spam đăng nhập (tối đa 5 lần / 60 giây) ---
 def check_rate_limit(client_ip: str):
     now = time.time()
     history = [t for t in login_attempts.get(client_ip, []) if now - t < 60.0]
@@ -88,8 +109,13 @@ class AuthPayload(BaseModel):
     password: str
 
 @app.get("/")
+@app.head("/")
 def health_check():
-    return {"status": "online", "message": "Server game đang hoạt động"}
+    return {
+        "status": "online",
+        "database": "postgresql" if dung_postgres() else "sqlite",
+        "message": "Server game đang hoạt động"
+    }
 
 @app.post("/register")
 def register(payload: AuthPayload):
@@ -102,13 +128,23 @@ def register(payload: AuthPayload):
     pwd_hash, salt_hex = hash_password(payload.password)
     conn = get_db()
     try:
-        conn.execute(
-            "INSERT INTO users (username, password_hash, salt, created_at) VALUES (?, ?, ?, ?)",
-            (payload.username, pwd_hash, salt_hex, time.time())
-        )
-        conn.commit()
-    except sqlite3.IntegrityError:
-        raise HTTPException(status_code=409, detail={"message": "Tên đăng nhập đã tồn tại!"})
+        if dung_postgres():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO users (username, password_hash, salt, created_at) VALUES (%s, %s, %s, %s)",
+                    (payload.username, pwd_hash, salt_hex, time.time())
+                )
+            conn.commit()
+        else:
+            conn.execute(
+                "INSERT INTO users (username, password_hash, salt, created_at) VALUES (?, ?, ?, ?)",
+                (payload.username, pwd_hash, salt_hex, time.time())
+            )
+            conn.commit()
+    except Exception as e:
+        if "unique" in str(e).lower() or "integrity" in str(e).lower():
+            raise HTTPException(status_code=409, detail={"message": "Tên đăng nhập đã tồn tại!"})
+        raise HTTPException(status_code=500, detail={"message": "Lỗi cơ sở dữ liệu!"})
     finally:
         conn.close()
 
@@ -120,7 +156,12 @@ def login(payload: AuthPayload, request: Request):
     check_rate_limit(client_ip)
 
     conn = get_db()
-    row = conn.execute("SELECT * FROM users WHERE username = ?", (payload.username,)).fetchone()
+    if dung_postgres():
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM users WHERE username = %s", (payload.username,))
+            row = cur.fetchone()
+    else:
+        row = conn.execute("SELECT * FROM users WHERE username = ?", (payload.username,)).fetchone()
     conn.close()
 
     if row is None:
@@ -129,10 +170,8 @@ def login(payload: AuthPayload, request: Request):
     if not verify_password(payload.password, row["password_hash"], row["salt"]):
         raise HTTPException(status_code=401, detail={"message": "Sai mật khẩu!"})
 
-    # Xóa lịch sử thử sai khi đăng nhập thành công
     login_attempts.pop(client_ip, None)
 
-    # Tạo Token xác thực có hiệu lực 7 ngày
     token = jwt.encode(
         {
             "uid": row["id"],
@@ -156,7 +195,6 @@ def login(payload: AuthPayload, request: Request):
         }
     }
 
-# --- Endpoint mẫu có kiểm tra Token chống giả mạo ---
 @app.get("/me")
 def get_my_profile(authorization: str = Header(default="")):
     if not authorization.startswith("Bearer "):
@@ -168,10 +206,18 @@ def get_my_profile(authorization: str = Header(default="")):
         raise HTTPException(status_code=401, detail={"message": "Phiên đăng nhập hết hạn hoặc không hợp lệ!"})
 
     conn = get_db()
-    row = conn.execute(
-        "SELECT username, selected_character, level, vang, da_quy FROM users WHERE id = ?",
-        (decoded["uid"],)
-    ).fetchone()
+    if dung_postgres():
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT username, selected_character, level, vang, da_quy FROM users WHERE id = %s",
+                (decoded["uid"],)
+            )
+            row = cur.fetchone()
+    else:
+        row = conn.execute(
+            "SELECT username, selected_character, level, vang, da_quy FROM users WHERE id = ?",
+            (decoded["uid"],)
+        ).fetchone()
     conn.close()
 
     if row is None:
