@@ -30,6 +30,8 @@ GAME_SERVERS = [
     {"id": "S1", "name": "S1 - Thạch Hạo", "status": "Mới", "recommended": True},
     {"id": "S2", "name": "S2 - Bổ Thiên Các", "status": "Tốt", "recommended": False},
     {"id": "S3", "name": "S3 - Hư Thần Giới", "status": "Đông", "recommended": False},
+    {"id": "S4", "name": "S4 - Thử Nghiệm", "status": "Đông", "recommended": False},
+
 ]
 
 login_attempts: dict[str, list[float]] = {}
