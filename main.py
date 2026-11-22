@@ -25,13 +25,12 @@ SECRET_KEY = os.getenv("SECRET_KEY", "doi_chuoi_bi_mat_nay_khi_dua_len_server_20
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DB_PATH = "game_server.db"
 
-# Danh sách cụm server của game (bạn có thể mở thêm S4, S5... tại đây bất cứ lúc nào)
+# Danh sách cụm server của game (bạn có thể mở thêm S5, S6... tại đây bất cứ lúc nào)
 GAME_SERVERS = [
     {"id": "S1", "name": "S1 - Thạch Hạo", "status": "Mới", "recommended": True},
     {"id": "S2", "name": "S2 - Bổ Thiên Các", "status": "Tốt", "recommended": False},
     {"id": "S3", "name": "S3 - Hư Thần Giới", "status": "Đông", "recommended": False},
     {"id": "S4", "name": "S4 - Thử Nghiệm", "status": "Đông", "recommended": False},
-
 ]
 
 login_attempts: dict[str, list[float]] = {}
@@ -126,13 +125,13 @@ def validate_username(username: str) -> str | None:
         return "Tên đăng nhập phải từ 4 đến 24 ký tự!"
     return None
 
-def check_rate_limit(client_ip: str):
+def check_rate_limit(key: str):
     now = time.time()
-    history = [t for t in login_attempts.get(client_ip, []) if now - t < 60.0]
+    history = [t for t in login_attempts.get(key, []) if now - t < 60.0]
     if len(history) >= 5:
         raise HTTPException(status_code=429, detail={"message": "Thử sai quá nhiều lần, vui lòng đợi 1 phút!"})
     history.append(now)
-    login_attempts[client_ip] = history
+    login_attempts[key] = history
 
 def decode_user_from_header(authorization: str) -> dict:
     if not authorization.startswith("Bearer "):
@@ -261,7 +260,8 @@ def list_servers(authorization: str = Header(default="")):
 
 @app.post("/register")
 def register(payload: AuthPayload):
-    err = validate_username(payload.username)
+    clean_username = payload.username.strip()
+    err = validate_username(clean_username)
     if err:
         raise HTTPException(status_code=400, detail={"message": err})
     if len(payload.password) < 4:
@@ -275,7 +275,7 @@ def register(payload: AuthPayload):
             with conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO users (username, password_hash, salt, created_at) VALUES (%s, %s, %s, %s) RETURNING id",
-                    (payload.username, pwd_hash, salt_hex, now)
+                    (clean_username, pwd_hash, salt_hex, now)
                 )
                 new_uid = cur.fetchone()["id"]
                 cur.execute("DELETE FROM player_saves WHERE user_id = %s", (new_uid,))
@@ -283,7 +283,7 @@ def register(payload: AuthPayload):
         else:
             cur = conn.execute(
                 "INSERT INTO users (username, password_hash, salt, created_at) VALUES (?, ?, ?, ?)",
-                (payload.username, pwd_hash, salt_hex, now)
+                (clean_username, pwd_hash, salt_hex, now)
             )
             new_uid = cur.lastrowid
             conn.execute("DELETE FROM player_saves WHERE user_id = ?", (new_uid,))
@@ -299,16 +299,17 @@ def register(payload: AuthPayload):
 
 @app.post("/login")
 def login(payload: AuthPayload, request: Request):
-    client_ip = request.client.host if request.client else "unknown"
-    check_rate_limit(client_ip)
+    clean_username = payload.username.strip()
+    rate_key = clean_username.lower() or (request.client.host if request.client else "unknown")
+    check_rate_limit(rate_key)
 
     conn = get_db()
     if dung_postgres():
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM users WHERE username = %s", (payload.username,))
+            cur.execute("SELECT * FROM users WHERE username = %s", (clean_username,))
             row = cur.fetchone()
     else:
-        row = conn.execute("SELECT * FROM users WHERE username = ?", (payload.username,)).fetchone()
+        row = conn.execute("SELECT * FROM users WHERE username = ?", (clean_username,)).fetchone()
     conn.close()
 
     if row is None:
@@ -318,7 +319,7 @@ def login(payload: AuthPayload, request: Request):
     if not verify_password(payload.password, row_dict["password_hash"], row_dict["salt"]):
         raise HTTPException(status_code=401, detail={"message": "Sai mật khẩu!"})
 
-    login_attempts.pop(client_ip, None)
+    login_attempts.pop(rate_key, None)
 
     token = jwt.encode(
         {
