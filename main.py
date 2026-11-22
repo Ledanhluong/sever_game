@@ -27,7 +27,7 @@ DB_PATH = "game_server.db"
 
 # Danh sách cụm server của game (bạn có thể mở thêm S4, S5... tại đây bất cứ lúc nào)
 GAME_SERVERS = [
-    {"id": "S1", "name": "S1 - Thạch Thôn", "status": "Mới", "recommended": True},
+    {"id": "S1", "name": "S1 - Thạch Hạo", "status": "Mới", "recommended": True},
     {"id": "S2", "name": "S2 - Bổ Thiên Các", "status": "Tốt", "recommended": False},
     {"id": "S3", "name": "S3 - Hư Thần Giới", "status": "Đông", "recommended": False},
 ]
@@ -209,7 +209,7 @@ def health_check():
 
 @app.get("/servers")
 def list_servers(authorization: str = Header(default="")):
-    # Trả về danh sách server kèm thông tin nhân vật đã tạo ở từng server (nếu có)
+    # Chỉ tính là đã có nhân vật khi người chơi thực sự bấm xác nhận chọn nhân vật (da_chon_nhan_vat = True)
     played_map: dict[str, dict] = {}
     if authorization.startswith("Bearer "):
         try:
@@ -217,14 +217,30 @@ def list_servers(authorization: str = Header(default="")):
             conn = get_db()
             if dung_postgres():
                 with conn.cursor() as cur:
-                    cur.execute("SELECT server_id, level, selected_character FROM player_saves WHERE user_id = %s", (decoded["uid"],))
+                    cur.execute(
+                        "SELECT server_id, level, selected_character, game_data FROM player_saves WHERE user_id = %s",
+                        (decoded["uid"],)
+                    )
                     rows = cur.fetchall()
             else:
-                rows = conn.execute("SELECT server_id, level, selected_character FROM player_saves WHERE user_id = ?", (decoded["uid"],)).fetchall()
+                rows = conn.execute(
+                    "SELECT server_id, level, selected_character, game_data FROM player_saves WHERE user_id = ?",
+                    (decoded["uid"],)
+                ).fetchall()
             conn.close()
             for r in rows:
                 rd = dict(r)
-                played_map[rd["server_id"]] = {"level": rd["level"], "selected_character": rd["selected_character"]}
+                raw_extra = rd.get("game_data") or "{}"
+                try:
+                    extra_dict = json.loads(raw_extra) if isinstance(raw_extra, str) else dict(raw_extra)
+                except Exception:
+                    extra_dict = {}
+
+                if extra_dict.get("da_chon_nhan_vat") is True:
+                    played_map[rd["server_id"]] = {
+                        "level": rd["level"],
+                        "selected_character": rd["selected_character"]
+                    }
         except Exception:
             pass
 
@@ -278,6 +294,7 @@ def register(payload: AuthPayload):
         conn.close()
 
     return {"ok": True, "message": "Đăng ký thành công!"}
+
 @app.post("/login")
 def login(payload: AuthPayload, request: Request):
     client_ip = request.client.host if request.client else "unknown"
