@@ -256,15 +256,19 @@ def register(payload: AuthPayload):
         if dung_postgres():
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO users (username, password_hash, salt, created_at) VALUES (%s, %s, %s, %s)",
+                    "INSERT INTO users (username, password_hash, salt, created_at) VALUES (%s, %s, %s, %s) RETURNING id",
                     (payload.username, pwd_hash, salt_hex, now)
                 )
+                new_uid = cur.fetchone()["id"]
+                cur.execute("DELETE FROM player_saves WHERE user_id = %s", (new_uid,))
             conn.commit()
         else:
-            conn.execute(
+            cur = conn.execute(
                 "INSERT INTO users (username, password_hash, salt, created_at) VALUES (?, ?, ?, ?)",
                 (payload.username, pwd_hash, salt_hex, now)
             )
+            new_uid = cur.lastrowid
+            conn.execute("DELETE FROM player_saves WHERE user_id = ?", (new_uid,))
             conn.commit()
     except Exception as e:
         if "unique" in str(e).lower() or "integrity" in str(e).lower():
@@ -274,7 +278,6 @@ def register(payload: AuthPayload):
         conn.close()
 
     return {"ok": True, "message": "Đăng ký thành công!"}
-
 @app.post("/login")
 def login(payload: AuthPayload, request: Request):
     client_ip = request.client.host if request.client else "unknown"
