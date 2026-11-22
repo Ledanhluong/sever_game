@@ -5,6 +5,7 @@ import time
 import hmac
 import hashlib
 import sqlite3
+from urllib.parse import urlencode
 import jwt
 import httpx
 import psycopg
@@ -378,14 +379,13 @@ def login(payload: AuthPayload, request: Request):
     }
 
 # =================================================================
-# ĐĂNG NHẬP FACEBOOK (OAUTH WEB FLOW)
+# ĐĂNG NHẬP FACEBOOK (OAUTH WEB FLOW + DEEP LINK TỰ QUAY VỀ GAME)
 # =================================================================
 @app.get("/auth/facebook")
 def facebook_login_start(state: str):
     if not FB_APP_ID or not FB_APP_SECRET:
         raise HTTPException(status_code=500, detail="Chưa cấu hình FB_APP_ID / FB_APP_SECRET trên server")
     now = time.time()
-    # Dọn các phiên cũ quá 10 phút
     for k in list(pending_oauth.keys()):
         if now - pending_oauth[k].get("created_at", 0) > 600:
             pending_oauth.pop(k, None)
@@ -407,7 +407,7 @@ async def facebook_login_callback(code: str = "", state: str = "", error: str = 
         if state in pending_oauth:
             pending_oauth[state] = {"status": "error", "message": "Đã hủy đăng nhập Facebook!"}
         return HTMLResponse(
-            "<div style='font-family:sans-serif;text-align:center;margin-top:60px'>"
+            "<div style='font-family:sans-serif;text-align:center;margin-top:60px;background:#121212;color:#fff;padding:24px'>"
             "<h2>Đăng nhập Facebook thất bại hoặc đã hủy</h2>"
             "<p>Vui lòng quay lại ứng dụng game.</p></div>"
         )
@@ -455,12 +455,34 @@ async def facebook_login_callback(code: str = "", state: str = "", error: str = 
         "display_name": fb_name,
         "created_at": time.time(),
     }
-    return HTMLResponse(
-        "<div style='font-family:sans-serif;text-align:center;margin-top:60px'>"
-        "<h2>Đăng nhập Facebook thành công!</h2>"
-        "<p>Bạn có thể đóng trang này và quay lại game <b>Tu Tiên Hoàn Mỹ</b>.</p>"
-        "</div>"
-    )
+
+    query_str = urlencode({
+        "token": token,
+        "username": user_row["username"],
+        "display_name": fb_name,
+    })
+    deep_link = f"tutien://oauth-callback?{query_str}"
+
+    return HTMLResponse(f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Đang quay lại Tu Tiên Hoàn Mỹ...</title>
+    </head>
+    <body style="font-family:sans-serif;text-align:center;margin-top:80px;background:#121212;color:#fff;padding:20px;">
+        <h2>Đăng nhập Facebook thành công!</h2>
+        <p>Đang tự động quay trở lại game <b>Tu Tiên Hoàn Mỹ</b>...</p>
+        <a href="{deep_link}" style="display:inline-block;margin-top:20px;padding:12px 24px;background:#f59e0b;color:#000;font-weight:bold;border-radius:8px;text-decoration:none;">
+            Mở Tu Tiên Hoàn Mỹ
+        </a>
+        <script>
+            window.location.href = "{deep_link}";
+        </script>
+    </body>
+    </html>
+    """)
 
 @app.get("/auth/poll")
 def oauth_poll(state: str):
