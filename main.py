@@ -6,10 +6,12 @@ import hmac
 import hashlib
 import sqlite3
 import jwt
+import httpx
 import psycopg
 from psycopg.rows import dict_row
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 app = FastAPI(title="Tu Tien Game Backend")
@@ -25,6 +27,10 @@ SECRET_KEY = os.getenv("SECRET_KEY", "doi_chuoi_bi_mat_nay_khi_dua_len_server_20
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DB_PATH = "game_server.db"
 
+FB_APP_ID = os.getenv("FB_APP_ID", "").strip()
+FB_APP_SECRET = os.getenv("FB_APP_SECRET", "").strip()
+API_PUBLIC_URL = os.getenv("API_PUBLIC_URL", "https://tutien-backend-q0k6.onrender.com").strip().rstrip("/")
+
 # Danh sách cụm server của game (bạn có thể mở thêm S5, S6... tại đây bất cứ lúc nào)
 GAME_SERVERS = [
     {"id": "S1", "name": "S1 - Thạch Hạo", "status": "Mới", "recommended": True},
@@ -34,6 +40,7 @@ GAME_SERVERS = [
 ]
 
 login_attempts: dict[str, list[float]] = {}
+pending_oauth: dict[str, dict] = {}
 
 def dung_postgres() -> bool:
     return DATABASE_URL.startswith("postgres://") or DATABASE_URL.startswith("postgresql://")
@@ -112,6 +119,17 @@ def verify_password(password: str, stored_hash: str, salt_hex: str) -> bool:
     check_hash, _ = hash_password(password, salt_hex)
     return hmac.compare_digest(check_hash, stored_hash)
 
+def tao_jwt_token(uid: int, username: str) -> str:
+    return jwt.encode(
+        {
+            "uid": uid,
+            "username": username,
+            "exp": int(time.time()) + 7 * 86400
+        },
+        SECRET_KEY,
+        algorithm="HS256"
+    )
+
 def validate_username(username: str) -> str | None:
     if not username:
         return "Tên đăng nhập không được để trống!"
@@ -141,6 +159,37 @@ def decode_user_from_header(authorization: str) -> dict:
         return jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail={"message": "Phiên đăng nhập hết hạn hoặc không hợp lệ!"})
+
+def get_or_create_social_user(username: str) -> dict:
+    conn = get_db()
+    try:
+        if dung_postgres():
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM users WHERE username = %s", (username,))
+                row = cur.fetchone()
+                if row is None:
+                    pwd_hash, salt_hex = hash_password(os.urandom(24).hex())
+                    now = time.time()
+                    cur.execute(
+                        "INSERT INTO users (username, password_hash, salt, created_at) VALUES (%s, %s, %s, %s) RETURNING *",
+                        (username, pwd_hash, salt_hex, now)
+                    )
+                    row = cur.fetchone()
+                    conn.commit()
+        else:
+            row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+            if row is None:
+                pwd_hash, salt_hex = hash_password(os.urandom(24).hex())
+                now = time.time()
+                cur = conn.execute(
+                    "INSERT INTO users (username, password_hash, salt, created_at) VALUES (?, ?, ?, ?)",
+                    (username, pwd_hash, salt_hex, now)
+                )
+                conn.commit()
+                row = conn.execute("SELECT * FROM users WHERE id = ?", (cur.lastrowid,)).fetchone()
+        return dict(row)
+    finally:
+        conn.close()
 
 def get_or_create_server_save(conn, user_id: int, username: str, server_id: str) -> dict:
     valid_ids = {s["id"] for s in GAME_SERVERS}
@@ -210,7 +259,6 @@ def health_check():
 
 @app.get("/servers")
 def list_servers(authorization: str = Header(default="")):
-    # Chỉ tính là đã có nhân vật khi người chơi thực sự bấm xác nhận chọn nhân vật (da_chon_nhan_vat = True)
     played_map: dict[str, dict] = {}
     if authorization.startswith("Bearer "):
         try:
@@ -320,16 +368,7 @@ def login(payload: AuthPayload, request: Request):
         raise HTTPException(status_code=401, detail={"message": "Sai mật khẩu!"})
 
     login_attempts.pop(rate_key, None)
-
-    token = jwt.encode(
-        {
-            "uid": row_dict["id"],
-            "username": row_dict["username"],
-            "exp": int(time.time()) + 7 * 86400
-        },
-        SECRET_KEY,
-        algorithm="HS256"
-    )
+    token = tao_jwt_token(row_dict["id"], row_dict["username"])
 
     return {
         "ok": True,
@@ -337,6 +376,100 @@ def login(payload: AuthPayload, request: Request):
         "token": token,
         "username": row_dict["username"]
     }
+
+# =================================================================
+# ĐĂNG NHẬP FACEBOOK (OAUTH WEB FLOW)
+# =================================================================
+@app.get("/auth/facebook")
+def facebook_login_start(state: str):
+    if not FB_APP_ID or not FB_APP_SECRET:
+        raise HTTPException(status_code=500, detail="Chưa cấu hình FB_APP_ID / FB_APP_SECRET trên server")
+    now = time.time()
+    # Dọn các phiên cũ quá 10 phút
+    for k in list(pending_oauth.keys()):
+        if now - pending_oauth[k].get("created_at", 0) > 600:
+            pending_oauth.pop(k, None)
+
+    pending_oauth[state] = {"status": "pending", "created_at": now}
+    redirect_uri = f"{API_PUBLIC_URL}/auth/facebook/callback"
+    fb_url = (
+        f"https://www.facebook.com/v20.0/dialog/oauth"
+        f"?client_id={FB_APP_ID}"
+        f"&redirect_uri={redirect_uri}"
+        f"&state={state}"
+        f"&scope=public_profile"
+    )
+    return RedirectResponse(url=fb_url)
+
+@app.get("/auth/facebook/callback")
+async def facebook_login_callback(code: str = "", state: str = "", error: str = ""):
+    if error or not code or state not in pending_oauth:
+        if state in pending_oauth:
+            pending_oauth[state] = {"status": "error", "message": "Đã hủy đăng nhập Facebook!"}
+        return HTMLResponse(
+            "<div style='font-family:sans-serif;text-align:center;margin-top:60px'>"
+            "<h2>Đăng nhập Facebook thất bại hoặc đã hủy</h2>"
+            "<p>Vui lòng quay lại ứng dụng game.</p></div>"
+        )
+
+    redirect_uri = f"{API_PUBLIC_URL}/auth/facebook/callback"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            token_res = await client.get(
+                "https://graph.facebook.com/v20.0/oauth/access_token",
+                params={
+                    "client_id": FB_APP_ID,
+                    "client_secret": FB_APP_SECRET,
+                    "redirect_uri": redirect_uri,
+                    "code": code,
+                },
+            )
+            token_json = token_res.json()
+            fb_token = token_json.get("access_token")
+            if not fb_token:
+                pending_oauth[state] = {"status": "error", "message": "Không xác thực được với Facebook!"}
+                return HTMLResponse("<h3>Lỗi xác thực Facebook. Vui lòng thử lại trong game.</h3>")
+
+            me_res = await client.get(
+                "https://graph.facebook.com/v20.0/me",
+                params={"fields": "id,name", "access_token": fb_token},
+            )
+            me_json = me_res.json()
+            fb_id = str(me_json.get("id", "")).strip()
+            fb_name = str(me_json.get("name", f"FB_{fb_id}")).strip()
+            if not fb_id:
+                pending_oauth[state] = {"status": "error", "message": "Không lấy được ID Facebook!"}
+                return HTMLResponse("<h3>Không lấy được thông tin tài khoản Facebook.</h3>")
+    except Exception:
+        pending_oauth[state] = {"status": "error", "message": "Lỗi kết nối máy chủ Facebook!"}
+        return HTMLResponse("<h3>Lỗi kết nối Facebook. Vui lòng thử lại.</h3>")
+
+    username_game = f"fb_{fb_id}"
+    user_row = get_or_create_social_user(username_game)
+    token = tao_jwt_token(user_row["id"], user_row["username"])
+
+    pending_oauth[state] = {
+        "status": "ok",
+        "token": token,
+        "username": user_row["username"],
+        "display_name": fb_name,
+        "created_at": time.time(),
+    }
+    return HTMLResponse(
+        "<div style='font-family:sans-serif;text-align:center;margin-top:60px'>"
+        "<h2>Đăng nhập Facebook thành công!</h2>"
+        "<p>Bạn có thể đóng trang này và quay lại game <b>Tu Tiên Hoàn Mỹ</b>.</p>"
+        "</div>"
+    )
+
+@app.get("/auth/poll")
+def oauth_poll(state: str):
+    info = pending_oauth.get(state)
+    if not info:
+        return {"status": "not_found"}
+    if info.get("status") in ("ok", "error"):
+        return pending_oauth.pop(state)
+    return {"status": "pending"}
 
 @app.get("/me")
 def get_my_account(authorization: str = Header(default="")):
