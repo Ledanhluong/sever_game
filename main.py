@@ -451,8 +451,9 @@ async def facebook_login_callback(code: str = "", state: str = "", error: str = 
             token_json = token_res.json()
             fb_token = token_json.get("access_token")
             if not fb_token:
-                pending_oauth[state] = {"status": "error", "message": "Không xác thực được với Facebook!"}
-                return HTMLResponse("<h3>Lỗi xác thực Facebook. Vui lòng thử lại trong game.</h3>")
+                err_fb = token_json.get("error", {}).get("message", str(token_json))
+                pending_oauth[state] = {"status": "error", "message": f"Lỗi FB: {err_fb}"}
+                return HTMLResponse(f"<h3>Lỗi xác thực Facebook: {err_fb}</h3>")
 
             me_res = await client.get(
                 "https://graph.facebook.com/v20.0/me",
