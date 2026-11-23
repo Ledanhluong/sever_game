@@ -42,6 +42,7 @@ GAME_SERVERS = [
 
 login_attempts: dict[str, list[float]] = {}
 pending_oauth: dict[str, dict] = {}
+used_oauth_codes: dict[str, dict] = {}
 
 
 def dung_postgres() -> bool:
@@ -250,6 +251,45 @@ def get_or_create_server_save(conn, user_id: int, username: str, server_id: str)
     }
 
 
+def _tao_html_quay_ve_game(token: str, username: str, display_name: str) -> str:
+    query_str = urlencode({
+        "token": token,
+        "username": username,
+        "display_name": display_name,
+    })
+    deep_link = f"tutien://oauth-callback?{query_str}"
+    android_intent_link = (
+        f"intent://oauth-callback?{query_str}"
+        f"#Intent;scheme=tutien;action=android.intent.action.VIEW;"
+        f"category=android.intent.category.BROWSABLE;end"
+    )
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Đang quay lại Tu Tiên Hoàn Mỹ...</title>
+    </head>
+    <body style="font-family:sans-serif;text-align:center;margin-top:80px;background:#121212;color:#fff;padding:20px;">
+        <h2>Đăng nhập Facebook thành công!</h2>
+        <p>Đang tự động quay trở lại game <b>Tu Tiên Hoàn Mỹ</b>...</p>
+        <a id="openGameBtn" href="{deep_link}" style="display:inline-block;margin-top:20px;padding:12px 24px;background:#f59e0b;color:#000;font-weight:bold;border-radius:8px;text-decoration:none;">
+            Mở Tu Tiên Hoàn Mỹ
+        </a>
+        <script>
+            var isAndroid = /Android/i.test(navigator.userAgent);
+            var targetUrl = isAndroid ? "{android_intent_link}" : "{deep_link}";
+            window.location.replace(targetUrl);
+            setTimeout(function() {{
+                window.location.href = "{deep_link}";
+            }}, 400);
+        </script>
+    </body>
+    </html>
+    """
+
+
 class AuthPayload(BaseModel):
     username: str
     password: str
@@ -412,6 +452,9 @@ def facebook_login_start(state: str):
     for k in list(pending_oauth.keys()):
         if now - pending_oauth[k].get("created_at", 0) > 600:
             pending_oauth.pop(k, None)
+    for k in list(used_oauth_codes.keys()):
+        if now - used_oauth_codes[k].get("created_at", 0) > 600:
+            used_oauth_codes.pop(k, None)
 
     pending_oauth[state] = {"status": "pending", "created_at": now}
     redirect_uri = f"{API_PUBLIC_URL}/auth/facebook/callback"
@@ -427,8 +470,18 @@ def facebook_login_start(state: str):
 
 @app.get("/auth/facebook/callback")
 async def facebook_login_callback(code: str = "", state: str = "", error: str = ""):
+    # Nếu trình duyệt gọi trùng lần 2 với cùng một code đã xử lý thành công -> trả thẳng trang quay về game
+    if code and code in used_oauth_codes:
+        cached = used_oauth_codes[code]
+        return HTMLResponse(_tao_html_quay_ve_game(cached["token"], cached["username"], cached["display_name"]))
+
+    # Nếu state này đã được xác thực thành công trước đó -> trả thẳng trang quay về game
+    if state and pending_oauth.get(state, {}).get("status") == "ok":
+        cached_state = pending_oauth[state]
+        return HTMLResponse(_tao_html_quay_ve_game(cached_state["token"], cached_state["username"], cached_state["display_name"]))
+
     if error or not code or state not in pending_oauth:
-        if state in pending_oauth:
+        if state in pending_oauth and pending_oauth[state].get("status") != "ok":
             pending_oauth[state] = {"status": "error", "message": "Đã hủy đăng nhập Facebook!"}
         return HTMLResponse(
             "<div style='font-family:sans-serif;text-align:center;margin-top:60px;background:#121212;color:#fff;padding:24px'>"
@@ -451,6 +504,14 @@ async def facebook_login_callback(code: str = "", state: str = "", error: str = 
             token_json = token_res.json()
             fb_token = token_json.get("access_token")
             if not fb_token:
+                # Kiểm tra lại lần nữa đề phòng request song song vừa hoàn tất xong
+                if code in used_oauth_codes:
+                    cached = used_oauth_codes[code]
+                    return HTMLResponse(_tao_html_quay_ve_game(cached["token"], cached["username"], cached["display_name"]))
+                if pending_oauth.get(state, {}).get("status") == "ok":
+                    cached_state = pending_oauth[state]
+                    return HTMLResponse(_tao_html_quay_ve_game(cached_state["token"], cached_state["username"], cached_state["display_name"]))
+
                 err_fb = token_json.get("error", {}).get("message", str(token_json))
                 pending_oauth[state] = {"status": "error", "message": f"Lỗi FB: {err_fb}"}
                 return HTMLResponse(f"<h3>Lỗi xác thực Facebook: {err_fb}</h3>")
@@ -463,61 +524,30 @@ async def facebook_login_callback(code: str = "", state: str = "", error: str = 
             fb_id = str(me_json.get("id", "")).strip()
             fb_name = str(me_json.get("name", f"FB_{fb_id}")).strip()
             if not fb_id:
-                pending_oauth[state] = {"status": "error", "message": "Không lấy được ID Facebook!"}
+                if pending_oauth.get(state, {}).get("status") != "ok":
+                    pending_oauth[state] = {"status": "error", "message": "Không lấy được ID Facebook!"}
                 return HTMLResponse("<h3>Không lấy được thông tin tài khoản Facebook.</h3>")
     except Exception:
-        pending_oauth[state] = {"status": "error", "message": "Lỗi kết nối máy chủ Facebook!"}
+        if pending_oauth.get(state, {}).get("status") != "ok":
+            pending_oauth[state] = {"status": "error", "message": "Lỗi kết nối máy chủ Facebook!"}
         return HTMLResponse("<h3>Lỗi kết nối Facebook. Vui lòng thử lại.</h3>")
 
     username_game = f"fb_{fb_id}"
     user_row = get_or_create_social_user(username_game)
     token = tao_jwt_token(user_row["id"], user_row["username"])
 
-    pending_oauth[state] = {
+    now = time.time()
+    result_payload = {
         "status": "ok",
         "token": token,
         "username": user_row["username"],
         "display_name": fb_name,
-        "created_at": time.time(),
+        "created_at": now,
     }
+    used_oauth_codes[code] = result_payload
+    pending_oauth[state] = result_payload
 
-    query_str = urlencode({
-        "token": token,
-        "username": user_row["username"],
-        "display_name": fb_name,
-    })
-    deep_link = f"tutien://oauth-callback?{query_str}"
-    android_intent_link = (
-        f"intent://oauth-callback?{query_str}"
-        f"#Intent;scheme=tutien;action=android.intent.action.VIEW;"
-        f"category=android.intent.category.BROWSABLE;end"
-    )
-
-    return HTMLResponse(f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Đang quay lại Tu Tiên Hoàn Mỹ...</title>
-    </head>
-    <body style="font-family:sans-serif;text-align:center;margin-top:80px;background:#121212;color:#fff;padding:20px;">
-        <h2>Đăng nhập Facebook thành công!</h2>
-        <p>Đang tự động quay trở lại game <b>Tu Tiên Hoàn Mỹ</b>...</p>
-        <a id="openGameBtn" href="{deep_link}" style="display:inline-block;margin-top:20px;padding:12px 24px;background:#f59e0b;color:#000;font-weight:bold;border-radius:8px;text-decoration:none;">
-            Mở Tu Tiên Hoàn Mỹ
-        </a>
-        <script>
-            var isAndroid = /Android/i.test(navigator.userAgent);
-            var targetUrl = isAndroid ? "{android_intent_link}" : "{deep_link}";
-            window.location.replace(targetUrl);
-            setTimeout(function() {{
-                window.location.href = "{deep_link}";
-            }}, 400);
-        </script>
-    </body>
-    </html>
-    """)
+    return HTMLResponse(_tao_html_quay_ve_game(token, user_row["username"], fb_name))
 
 
 @app.post("/auth/facebook-token")
