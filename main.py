@@ -43,8 +43,10 @@ GAME_SERVERS = [
 login_attempts: dict[str, list[float]] = {}
 pending_oauth: dict[str, dict] = {}
 
+
 def dung_postgres() -> bool:
     return DATABASE_URL.startswith("postgres://") or DATABASE_URL.startswith("postgresql://")
+
 
 def get_db():
     if dung_postgres():
@@ -53,6 +55,7 @@ def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
 
 def init_db():
     conn = get_db()
@@ -109,16 +112,20 @@ def init_db():
         conn.commit()
     conn.close()
 
+
 init_db()
+
 
 def hash_password(password: str, salt_hex: str | None = None) -> tuple[str, str]:
     salt = bytes.fromhex(salt_hex) if salt_hex else os.urandom(16)
     pwd_hash = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 120_000)
     return pwd_hash.hex(), salt.hex()
 
+
 def verify_password(password: str, stored_hash: str, salt_hex: str) -> bool:
     check_hash, _ = hash_password(password, salt_hex)
     return hmac.compare_digest(check_hash, stored_hash)
+
 
 def tao_jwt_token(uid: int, username: str) -> str:
     return jwt.encode(
@@ -130,6 +137,7 @@ def tao_jwt_token(uid: int, username: str) -> str:
         SECRET_KEY,
         algorithm="HS256"
     )
+
 
 def validate_username(username: str) -> str | None:
     if not username:
@@ -144,6 +152,7 @@ def validate_username(username: str) -> str | None:
         return "Tên đăng nhập phải từ 4 đến 24 ký tự!"
     return None
 
+
 def check_rate_limit(key: str):
     now = time.time()
     history = [t for t in login_attempts.get(key, []) if now - t < 60.0]
@@ -151,6 +160,7 @@ def check_rate_limit(key: str):
         raise HTTPException(status_code=429, detail={"message": "Thử sai quá nhiều lần, vui lòng đợi 1 phút!"})
     history.append(now)
     login_attempts[key] = history
+
 
 def decode_user_from_header(authorization: str) -> dict:
     if not authorization.startswith("Bearer "):
@@ -160,6 +170,7 @@ def decode_user_from_header(authorization: str) -> dict:
         return jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail={"message": "Phiên đăng nhập hết hạn hoặc không hợp lệ!"})
+
 
 def get_or_create_social_user(username: str) -> dict:
     conn = get_db()
@@ -191,6 +202,7 @@ def get_or_create_social_user(username: str) -> dict:
         return dict(row)
     finally:
         conn.close()
+
 
 def get_or_create_server_save(conn, user_id: int, username: str, server_id: str) -> dict:
     valid_ids = {s["id"] for s in GAME_SERVERS}
@@ -237,9 +249,15 @@ def get_or_create_server_save(conn, user_id: int, username: str, server_id: str)
         "game_data": extra_dict
     }
 
+
 class AuthPayload(BaseModel):
     username: str
     password: str
+
+
+class FacebookTokenPayload(BaseModel):
+    access_token: str
+
 
 class SyncPayload(BaseModel):
     server_id: str = "S1"
@@ -249,6 +267,7 @@ class SyncPayload(BaseModel):
     da_quy: int = Field(ge=0, le=100_000_000)
     game_data: dict = Field(default_factory=dict)
 
+
 @app.get("/")
 @app.head("/")
 def health_check():
@@ -257,6 +276,7 @@ def health_check():
         "database": "postgresql" if dung_postgres() else "sqlite",
         "message": "Server game đang hoạt động"
     }
+
 
 @app.get("/servers")
 def list_servers(authorization: str = Header(default="")):
@@ -307,6 +327,7 @@ def list_servers(authorization: str = Header(default="")):
 
     return {"ok": True, "servers": result}
 
+
 @app.post("/register")
 def register(payload: AuthPayload):
     clean_username = payload.username.strip()
@@ -346,6 +367,7 @@ def register(payload: AuthPayload):
 
     return {"ok": True, "message": "Đăng ký thành công!"}
 
+
 @app.post("/login")
 def login(payload: AuthPayload, request: Request):
     clean_username = payload.username.strip()
@@ -378,8 +400,9 @@ def login(payload: AuthPayload, request: Request):
         "username": row_dict["username"]
     }
 
+
 # =================================================================
-# ĐĂNG NHẬP FACEBOOK (OAUTH WEB FLOW + DEEP LINK TỰ QUAY VỀ GAME)
+# ĐĂNG NHẬP FACEBOOK (WEB OAUTH + DEEP LINK & NATIVE SDK TOKEN)
 # =================================================================
 @app.get("/auth/facebook")
 def facebook_login_start(state: str):
@@ -400,6 +423,7 @@ def facebook_login_start(state: str):
         f"&scope=public_profile"
     )
     return RedirectResponse(url=fb_url)
+
 
 @app.get("/auth/facebook/callback")
 async def facebook_login_callback(code: str = "", state: str = "", error: str = ""):
@@ -462,6 +486,11 @@ async def facebook_login_callback(code: str = "", state: str = "", error: str = 
         "display_name": fb_name,
     })
     deep_link = f"tutien://oauth-callback?{query_str}"
+    android_intent_link = (
+        f"intent://oauth-callback?{query_str}"
+        f"#Intent;scheme=tutien;action=android.intent.action.VIEW;"
+        f"category=android.intent.category.BROWSABLE;end"
+    )
 
     return HTMLResponse(f"""
     <!DOCTYPE html>
@@ -474,15 +503,58 @@ async def facebook_login_callback(code: str = "", state: str = "", error: str = 
     <body style="font-family:sans-serif;text-align:center;margin-top:80px;background:#121212;color:#fff;padding:20px;">
         <h2>Đăng nhập Facebook thành công!</h2>
         <p>Đang tự động quay trở lại game <b>Tu Tiên Hoàn Mỹ</b>...</p>
-        <a href="{deep_link}" style="display:inline-block;margin-top:20px;padding:12px 24px;background:#f59e0b;color:#000;font-weight:bold;border-radius:8px;text-decoration:none;">
+        <a id="openGameBtn" href="{deep_link}" style="display:inline-block;margin-top:20px;padding:12px 24px;background:#f59e0b;color:#000;font-weight:bold;border-radius:8px;text-decoration:none;">
             Mở Tu Tiên Hoàn Mỹ
         </a>
         <script>
-            window.location.href = "{deep_link}";
+            var isAndroid = /Android/i.test(navigator.userAgent);
+            var targetUrl = isAndroid ? "{android_intent_link}" : "{deep_link}";
+            window.location.replace(targetUrl);
+            setTimeout(function() {{
+                window.location.href = "{deep_link}";
+            }}, 400);
         </script>
     </body>
     </html>
     """)
+
+
+@app.post("/auth/facebook-token")
+async def facebook_login_with_sdk_token(payload: FacebookTokenPayload):
+    fb_token = payload.access_token.strip()
+    if not fb_token:
+        raise HTTPException(status_code=400, detail={"message": "Thiếu Facebook access token!"})
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            me_res = await client.get(
+                "https://graph.facebook.com/v20.0/me",
+                params={"fields": "id,name", "access_token": fb_token},
+            )
+            if me_res.status_code != 200:
+                raise HTTPException(status_code=401, detail={"message": "Token Facebook không hợp lệ hoặc đã hết hạn!"})
+
+            me_json = me_res.json()
+            fb_id = str(me_json.get("id", "")).strip()
+            fb_name = str(me_json.get("name", f"FB_{fb_id}")).strip()
+            if not fb_id:
+                raise HTTPException(status_code=401, detail={"message": "Không lấy được ID Facebook!"})
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=502, detail={"message": "Lỗi kết nối máy chủ Facebook!"})
+
+    username_game = f"fb_{fb_id}"
+    user_row = get_or_create_social_user(username_game)
+    token = tao_jwt_token(user_row["id"], user_row["username"])
+
+    return {
+        "ok": True,
+        "token": token,
+        "username": user_row["username"],
+        "display_name": fb_name
+    }
+
 
 @app.get("/auth/poll")
 def oauth_poll(state: str):
@@ -493,10 +565,12 @@ def oauth_poll(state: str):
         return pending_oauth.pop(state)
     return {"status": "pending"}
 
+
 @app.get("/me")
 def get_my_account(authorization: str = Header(default="")):
     decoded = decode_user_from_header(authorization)
     return {"ok": True, "username": decoded["username"]}
+
 
 @app.get("/character/{server_id}")
 def enter_server(server_id: str, authorization: str = Header(default="")):
@@ -505,6 +579,7 @@ def enter_server(server_id: str, authorization: str = Header(default="")):
     pdata = get_or_create_server_save(conn, decoded["uid"], decoded["username"], server_id)
     conn.close()
     return {"ok": True, "player_data": pdata}
+
 
 @app.post("/sync")
 def sync_player_data(payload: SyncPayload, authorization: str = Header(default="")):
